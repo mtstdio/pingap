@@ -32,8 +32,9 @@ use pingap_certificate::CertificateProvider;
 use pingap_certificate::{GlobalCertificate, TlsSettingParams};
 use pingap_config::ConfigManager;
 use pingap_core::BackgroundTask;
-#[cfg(feature = "tracing")]
-use pingap_core::HttpResponse;
+use pingap_core::{
+    HTTP_HEADER_CONTENT_TEXT, HTTP_HEADER_NO_CACHE, HttpResponse,
+};
 use pingap_core::LocationInstance;
 use pingap_core::PluginProvider;
 use pingap_core::new_internal_error;
@@ -1155,10 +1156,14 @@ impl Server {
                 "No matching location, host:{host} path:{}",
                 header.uri.path()
             );
-            // Nothing is configured for this host/path, which is the
-            // client's problem (wrong Host, unknown route), not a server
-            // fault: answer 404 rather than 500.
-            return Err(pingap_core::new_internal_error(404, message));
+            let resp = HttpResponse::builder(StatusCode::NOT_FOUND)
+                .body(message)
+                .header(HTTP_HEADER_CONTENT_TEXT.clone())
+                .header(HTTP_HEADER_NO_CACHE.clone())
+                .finish();
+            ctx.state.status = Some(resp.status);
+            resp.send(session).await?;
+            return Ok(true);
         };
 
         debug!(
@@ -3583,31 +3588,33 @@ value = 'proxy_set_headers = ["name:value"]'
 
     #[tokio::test]
     async fn test_no_matching_location_is_404() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
         let server = new_server();
         let input_header =
             "GET /nowhere HTTP/1.1\r\nHost: nomatch.example\r\n\r\n";
-        let mock_io = Builder::new().read(input_header.as_bytes()).build();
-        let mut session = Session::new_h1(Box::new(mock_io));
+        let (mut client, server_io) = tokio::io::duplex(4096);
+        client.write_all(input_header.as_bytes()).await.unwrap();
+
+        let mut session = Session::new_h1(Box::new(server_io));
         session.read_request().await.unwrap();
 
-        // No location matched during the early filter: the request must
-        // fail as a routing miss, not as a server error.
         let mut ctx = Ctx::default();
-        let err = server
+        let done = server
             .request_filter(&mut session, &mut ctx)
             .await
-            .expect_err("a request without a location cannot be served");
-        assert_eq!(
-            true,
-            matches!(err.etype(), pingora::ErrorType::HTTPStatus(404)),
-            "{err}"
-        );
-        assert_eq!(
-            true,
-            err.to_string()
-                .contains("No matching location, host:nomatch.example"),
-            "{err}"
-        );
+            .unwrap();
+        assert!(done);
+        assert_eq!(Some(StatusCode::NOT_FOUND), ctx.state.status);
+
+        let mut buf = vec![0u8; 1024];
+        let n = client.read(&mut buf).await.unwrap();
+        let resp_str = String::from_utf8_lossy(&buf[..n]);
+        assert!(resp_str.starts_with("HTTP/1.1 404 Not Found"));
+        assert!(resp_str.contains("Content-Type: text/plain"));
+        assert!(resp_str.contains("No matching location, host:nomatch.example path:/nowhere"));
+        assert!(!resp_str.contains("<html"));
+        assert!(!resp_str.contains("pingap"));
     }
 
     #[tokio::test]
