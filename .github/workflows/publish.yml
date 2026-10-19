@@ -44,12 +44,38 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  sync:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Sync and merge upstream
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/vicanso/pingap.git 2>/dev/null || true
+          git fetch upstream main
+          echo "Merging upstream/main..."
+          if git merge --no-edit upstream/main; then
+            echo "Successfully merged upstream/main"
+            git push origin ${{ github.ref_name }} || true
+          else
+            echo "Merge conflict with upstream"
+            exit 1
+          fi
+
   # The release starts as a draft, made here and by nobody else. Public
   # from the start, it was a release without files for the quarter of an
   # hour the builds take, and `install.sh` asks for the latest one. And
   # made by whichever build got there first, two of them could each make
   # a draft of their own.
   draft:
+    needs: [sync]
     runs-on: ubuntu-22.04
     permissions:
       contents: write # create the release
@@ -403,15 +429,8 @@ jobs:
           ./.github/workflows/upload_asset.sh ./pingap-windows.exe.zip $GITHUB_TOKEN
 
   docker:
-    # In a rehearsal the images are built and not pushed, without a login:
-    # test.yml builds the same Dockerfile on main, but only there, and
-    # only for a commit its tests have passed.
-    #
-    # The images of the two architectures are pushed under tags of this
-    # workflow's own (`release-amd64-full`), which `merge` puts together.
-    # They used to be the tags test.yml pushes for main (`amd64-full`), so
-    # an image of a commit on main that was pushed between the two jobs
-    # became a part of the version.
+    # Temporarily disabled
+    if: false
     needs: [draft]
     timeout-minutes: 3600
     runs-on: ${{ matrix.platform.runs-on }}
@@ -521,7 +540,8 @@ jobs:
           echo "default: ${{ steps.docker_build.outputs.digest }}"
           echo "distroless: ${{ steps.docker_build_distroless.outputs.digest }}"
   merge:
-    if: github.event_name == 'push'
+    # Temporarily disabled
+    if: false
     runs-on: ubuntu-22.04
     strategy:
       matrix:
@@ -562,7 +582,7 @@ jobs:
   # pointed at; run the failed job again, and this one after it.
   release:
     if: github.event_name == 'push'
-    needs: [macos, linux-musl-x86, linux-musl-aarch64, linux-gnu, merge]
+    needs: [macos, linux-musl-x86, linux-musl-aarch64, linux-gnu]
     runs-on: ubuntu-22.04
     permissions:
       contents: write # publish the release
